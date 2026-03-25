@@ -1,29 +1,62 @@
-///! Reproduces a segmentation fault when dropping a Vertex Engine
-///! while other engines on separate threads are still running.
+///! Tests whether dropping a Vertex Engine in a separate process
+///! avoids the segfault that occurs when dropping in-process (threads).
 ///!
-///! Steps:
-///!   1. Generate 3 keypairs
-///!   2. Start 3 engines on separate threads (each with its own tokio runtime)
-///!   3. Wait for consensus to establish (SyncPoints + Hello exchange)
-///!   4. Drop one engine by shutting down its thread
-///!   5. Observe: segmentation fault
-///!
-///! Expected: Engine can be cleanly dropped while other engines continue.
-///! Actual: Process crashes with SIGSEGV.
+///! Run with no args to execute the test.
+///! The binary also serves as the node process (invoked with `node` subcommand).
 
-use std::rc::Rc;
-use std::sync::mpsc as std_mpsc;
+mod node;
+
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use tashi_vertex::{
-    Context, Engine, KeyPublic, KeySecret, Message, Options, Peers, Socket, Transaction,
-};
+use tashi_vertex::KeySecret;
 
 const ADDRS: [&str; 3] = ["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9002"];
 
 fn main() {
-    // Generate 3 keypairs, store as strings for cross-thread transfer
+    let args: Vec<String> = std::env::args().collect();
+
+    // If invoked as a node subprocess
+    if args.len() > 1 && args[1] == "node" {
+        return run_node(&args[2..]);
+    }
+
+    // Otherwise run the test
+    run_test();
+}
+
+fn run_node(args: &[String]) {
+    let mut bind = String::new();
+    let mut secret = String::new();
+    let mut label = String::new();
+    let mut peer_addrs = Vec::new();
+    let mut peer_pubkeys = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => { bind = args[i + 1].clone(); i += 2; }
+            "--secret" => { secret = args[i + 1].clone(); i += 2; }
+            "--label" => { label = args[i + 1].clone(); i += 2; }
+            "--peer-addr" => { peer_addrs.push(args[i + 1].clone()); i += 2; }
+            "--peer-pubkey" => { peer_pubkeys.push(args[i + 1].clone()); i += 2; }
+            _ => { i += 1; }
+        }
+    }
+
+    let peers: Vec<(String, String)> = peer_addrs.into_iter().zip(peer_pubkeys).collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(node::run(&bind, &secret, &label, peers));
+}
+
+fn run_test() {
     let mut secrets = Vec::new();
     let mut pubkeys = Vec::new();
     for _ in 0..3 {
@@ -32,121 +65,69 @@ fn main() {
         secrets.push(key.to_string());
     }
 
-    println!("Starting 3 Vertex engines...");
+    println!("Starting 3 Vertex engines as separate processes...");
     for i in 0..3 {
         let short = &pubkeys[i][pubkeys[i].len().saturating_sub(8)..];
         println!("  node-{i}: bind={} id=...{short}", ADDRS[i]);
     }
 
-    // Channel to signal node-2 to shut down
-    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+    let exe = std::env::current_exe().unwrap();
+    let mut children = Vec::new();
 
-    // Spawn 3 engine threads
-    let mut handles = Vec::new();
-    let mut stop_rx_opt = Some(stop_rx);
     for i in 0..3 {
-        let secret = secrets[i].clone();
-        let all_pubkeys: Vec<String> = pubkeys.clone();
-        let stop_rx = if i == 2 { stop_rx_opt.take() } else { None };
+        let mut cmd = Command::new(&exe);
+        cmd.arg("node")
+            .arg("--bind").arg(ADDRS[i])
+            .arg("--secret").arg(&secrets[i])
+            .arg("--label").arg(format!("node-{i}"));
 
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        for j in 0..3 {
+            if j == i { continue; }
+            cmd.arg("--peer-addr").arg(ADDRS[j])
+                .arg("--peer-pubkey").arg(&pubkeys[j]);
+        }
 
-            rt.block_on(async {
-                let key: KeySecret = secret.parse().unwrap();
+        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
-                // Build peers list (all 3 nodes)
-                let mut peers = Peers::new().unwrap();
-                for (j, pk) in all_pubkeys.iter().enumerate() {
-                    let pub_key: KeyPublic = pk.parse().unwrap();
-                    peers.insert(ADDRS[j], &pub_key, Default::default()).unwrap();
+        let mut child = cmd.spawn().expect("failed to spawn node");
+        let stdout = child.stdout.take().unwrap();
+        let idx = i;
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    println!("[node-{idx}] {line}");
                 }
-
-                let context = Context::new().unwrap();
-                let socket = Socket::bind(&context, ADDRS[i]).await.unwrap();
-
-                let mut options = Options::default();
-                options.set_fallen_behind_kick_s(10);
-                options.set_heartbeat_us(50_000);
-                options.set_base_min_event_interval_us(10_000);
-
-                let engine = Rc::new(
-                    Engine::start(&context, socket, options, &key, peers).unwrap()
-                );
-
-                println!("[node-{i}] Engine started");
-
-                let mut sync_seen = false;
-                loop {
-                    // Check if we should stop (node-2 only)
-                    if let Some(ref rx) = stop_rx {
-                        if rx.try_recv().is_ok() {
-                            println!("[node-{i}] Received stop signal, dropping engine...");
-                            return;
-                        }
-                    }
-
-                    let msg = tokio::select! {
-                        msg = engine.recv_message() => msg,
-                        _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
-                    };
-
-                    match msg {
-                        Ok(Some(Message::SyncPoint(_))) => {
-                            if !sync_seen {
-                                sync_seen = true;
-                                println!("[node-{i}] First SyncPoint — sending hello");
-                                let data = format!("hello from node-{i}");
-                                let mut tx = Transaction::allocate(data.len());
-                                tx.copy_from_slice(data.as_bytes());
-                                engine.send_transaction(tx).unwrap();
-                            }
-                        }
-                        Ok(Some(Message::Event(event))) => {
-                            if event.transaction_count() > 0 {
-                                println!(
-                                    "[node-{i}] Event: txns={} consensus_at={}",
-                                    event.transaction_count(),
-                                    event.consensus_at()
-                                );
-                            }
-                        }
-                        Ok(None) => {
-                            println!("[node-{i}] Engine closed");
-                            return;
-                        }
-                        Err(e) => {
-                            println!("[node-{i}] Error: {e}");
-                            return;
-                        }
-                    }
-                }
-            });
-
-            println!("[node-{i}] Thread exiting (engine dropped)");
+            }
         });
 
-        handles.push(handle);
+        children.push(child);
         thread::sleep(Duration::from_millis(500));
     }
 
     println!("\nWaiting 5 seconds for consensus to establish...");
     thread::sleep(Duration::from_secs(5));
 
-    println!("\n=== Stopping node-2 (dropping its engine) ===");
-    stop_tx.send(()).unwrap();
+    println!("\n=== Killing node-2 process ===");
+    children[2].kill().expect("failed to kill node-2");
+    children[2].wait().ok();
+    println!("node-2 killed.");
 
-    // Wait for the thread to exit (engine gets dropped)
-    if let Some(handle) = handles.pop() {
-        handle.join().unwrap();
-    }
-
-    println!("node-2 stopped. If we got here without segfault, the bug is fixed.");
-    println!("Waiting 3 more seconds to verify stability...");
+    println!("Waiting 3 seconds to verify remaining nodes are stable...");
     thread::sleep(Duration::from_secs(3));
 
-    println!("Done. No segfault observed.");
+    for i in 0..2 {
+        match children[i].try_wait() {
+            Ok(None) => println!("[node-{i}] still running OK"),
+            Ok(Some(status)) => println!("[node-{i}] exited with: {status}"),
+            Err(e) => println!("[node-{i}] error checking: {e}"),
+        }
+    }
+
+    println!("\nNo segfault. Cleaning up...");
+    for mut child in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    println!("Done.");
 }

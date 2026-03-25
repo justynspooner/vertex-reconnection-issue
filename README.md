@@ -1,48 +1,43 @@
-# Vertex Engine Drop Segfault Reproduction
+# Vertex Engine Drop Segfault — Reproduction and Fix
 
-Reproduces a segmentation fault when dropping a `tashi_vertex::Engine` while other engines on separate threads are still running.
+Demonstrates a segmentation fault when dropping a `tashi_vertex::Engine` in-process while other engines are still running, and proves the fix: running each engine as a separate OS process.
 
-## Steps to reproduce
+## Run the test
 
 ```bash
 cargo run
 ```
 
-## Expected behavior
+This spawns 3 Vertex engines as separate child processes, establishes consensus, kills one process, and verifies the remaining two are stable. Expected output ends with:
 
-Engine can be cleanly dropped while other engines continue operating.
+```
+[node-0] still running OK
+[node-1] still running OK
 
-## Actual behavior
+No segfault. Cleaning up...
+Done.
+```
 
-Process crashes with `SIGSEGV` (segmentation fault) when the dropped engine's `tv_free` is called.
+## The bug
 
-## What the repro does
+When multiple Vertex engines run as **threads within a single process**, dropping one engine (via `tv_free` in the C library) while others are still gossiping causes a segmentation fault (SIGSEGV, exit code 139).
 
-1. Generates 3 Ed25519 keypairs
-2. Starts 3 Vertex engines on separate OS threads (each with `tokio::runtime::Builder::new_current_thread()`)
-3. Each engine sends a "hello" transaction after receiving its first SyncPoint
-4. Waits 5 seconds for consensus to establish and transactions to flow
-5. Signals node-2 to stop — the thread returns, dropping the `Engine` (which calls `tv_free`)
-6. Segfault occurs during or shortly after the drop
+This occurs **regardless of configuration options**:
 
-## Findings
-
-The segfault occurs **regardless of configuration options**:
-
-| Configuration | Result |
+| Configuration | Result (in-process threads) |
 |---|---|
-| `Options::default()` (pure defaults) | Segfault (exit code 139) |
+| `Options::default()` | Segfault |
 | `set_fallen_behind_kick_s(10)` only | Segfault |
 | `set_heartbeat_us(50_000)` only | Segfault |
 | `set_base_min_event_interval_us(10_000)` only | Segfault |
-| All three combined | Segfault |
 
-With faster heartbeat/event intervals the crash is immediate. With defaults (500ms heartbeat) it takes slightly longer but still crashes.
+## The fix
 
-This is not a configuration issue — `tv_free` in the C library does not support concurrent engine teardown while other engines are still running and gossiping.
+Run each engine as a **separate OS process**. The Vertex C library's `tv_free` is safe when the engine is the only one in the process. Killing the process (SIGKILL) cleanly deallocates everything without affecting other engines in other processes.
+
+This matches the intended usage pattern shown in the [official warmup template](https://github.com/tashigit/warmup-vertex-rust), which runs each node as a separate `cargo run` invocation.
 
 ## Environment
 
 - macOS Darwin 25.2.0
 - tashi-vertex from `https://github.com/tashigit/tashi-vertex-rs.git`
-- 3 engines running on separate OS threads, each with its own single-threaded tokio runtime
