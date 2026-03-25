@@ -1,0 +1,9 @@
+running: cd "/Users/justyn/dev/tashi/vertex-segfault-repro/target/debug/build/tashi-vertex-3b2d518ceeef7ece/out/build" && CMAKE_PREFIX_PATH="" LC_ALL="C" "cmake" "/Users/justyn/.cargo/git/checkouts/tashi-vertex-rs-2b69749ca4c000fa/3429080/" "-B" "/Users/justyn/dev/tashi/vertex-segfault-repro/target/debug/build/tashi-vertex-3b2d518ceeef7ece/out/build" "-DCMAKE_OSX_ARCHITECTURES=arm64" "-DCMAKE_INSTALL_PREFIX=/Users/justyn/dev/tashi/vertex-segfault-repro/target/debug/build/tashi-vertex-3b2d518ceeef7ece/out" "-DCMAKE_C_FLAGS= -ffunction-sections -fdata-sections -fPIC --target=arm64-apple-macosx -mmacosx-version-min=15.2 -w" "-DCMAKE_C_COMPILER=/usr/bin/cc" "-DCMAKE_CXX_FLAGS= -ffunction-sections -fdata-sections -fPIC --target=arm64-apple-macosx -mmacosx-version-min=15.2 -w" "-DCMAKE_CXX_COMPILER=/usr/bin/c++" "-DCMAKE_ASM_FLAGS= -ffunction-sections -fdata-sections -fPIC --target=arm64-apple-macosx -mmacosx-version-min=15.2 -w" "-DCMAKE_ASM_COMPILER=/usr/bin/cc" "-DCMAKE_BUILD_TYPE=Debug"
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    CMAKE_ASM_COMPILER
+    CMAKE_ASM_FLAGS
+
+
+running: cd "/Users/justyn/dev/tashi/vertex-segfault-repro/target/debug/build/tashi-vertex-3b2d518ceeef7ece/out/build" && LC_ALL="C" "cmake" "--build" "/Users/justyn/dev/tashi/vertex-segfault-repro/target/debug/build/tashi-vertex-3b2d518ceeef7ece/out/build" "--target" "install" "--config" "Debug" "--parallel" "8"

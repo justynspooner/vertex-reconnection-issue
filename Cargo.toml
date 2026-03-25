@@ -1,0 +1,8 @@
+[package]
+name = "vertex-segfault-repro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tashi-vertex = { git = "https://github.com/tashigit/tashi-vertex-rs.git" }
+tokio = { version = "1", features = ["full"] }
