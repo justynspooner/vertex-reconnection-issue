@@ -1,43 +1,52 @@
-# Vertex Engine Drop Segfault — Reproduction and Fix
+# Vertex Engine Reconnection Issue — Reproduction
 
-Demonstrates a segmentation fault when dropping a `tashi_vertex::Engine` in-process while other engines are still running, and proves the fix: running each engine as a separate OS process.
+A restarted Vertex node can send transactions to the cluster but never receives events back. Consensus continues among the remaining nodes but the restarted node is permanently frozen.
 
-## Run the test
+## Steps to reproduce
 
 ```bash
 cargo run
 ```
 
-This spawns 3 Vertex engines as separate child processes, establishes consensus, kills one process, and verifies the remaining two are stable. Expected output ends with:
+## What the repro does
 
-```
-[node-0] still running OK
-[node-1] still running OK
+1. Starts 4 Vertex engines as separate OS processes (f=1 fault tolerance)
+2. Waits for consensus — all 4 nodes exchange hello transactions successfully
+3. Kills node-3
+4. Waits 15 seconds (node-3 gets kicked via `fallen_behind_kick_s(10)`)
+5. Restarts node-3 with the same keypair, port, and peer list
+6. Node-3 sends a hello — the other 3 nodes receive it through consensus
+7. Waits 60 seconds — node-3 never receives any events
 
-No segfault. Cleaning up...
-Done.
-```
+## Expected behavior
 
-## The bug
+After restart, node-3 should receive consensus events from other nodes and fully participate in the cluster.
 
-When multiple Vertex engines run as **threads within a single process**, dropping one engine (via `tv_free` in the C library) while others are still gossiping causes a segmentation fault (SIGSEGV, exit code 139).
+## Actual behavior
 
-This occurs **regardless of configuration options**:
+- Node-3 gets SyncPoint #1 on boot, sends its hello transaction
+- Other nodes receive node-3's hello (consensus processes it)
+- Node-3 never receives another SyncPoint or Event
+- Consensus continues normally among nodes 0, 1, 2 (they exchange pings and get further SyncPoints)
+- Node-3 is permanently frozen — it can inject one transaction but never receives
 
-| Configuration | Result (in-process threads) |
+## Configurations tested
+
+All produce the same result:
+
+| Configuration | Receives events after restart? |
 |---|---|
-| `Options::default()` | Segfault |
-| `set_fallen_behind_kick_s(10)` only | Segfault |
-| `set_heartbeat_us(50_000)` only | Segfault |
-| `set_base_min_event_interval_us(10_000)` only | Segfault |
-
-## The fix
-
-Run each engine as a **separate OS process**. The Vertex C library's `tv_free` is safe when the engine is the only one in the process. Killing the process (SIGKILL) cleanly deallocates everything without affecting other engines in other processes.
-
-This matches the intended usage pattern shown in the [official warmup template](https://github.com/tashigit/warmup-vertex-rust), which runs each node as a separate `cargo run` invocation.
+| `Options::default()` | No |
+| `fallen_behind_kick_s(10)` | No |
+| `fallen_behind_kick_s(-1)` (never kick) | No |
+| `enable_state_sharing(true)` + `epoch_states_to_cache(3)` | No |
+| `fallen_behind_kick_s(10)` + `enable_state_sharing(true)` + `epoch_states_to_cache(3)` | No |
+| `report_gossip_events(true)` + `fallen_behind_kick_s(10)` | No |
+| `fallen_behind_kick_s(10)` + `enable_dynamic_epoch_size(false)` | No |
 
 ## Environment
 
 - macOS Darwin 25.2.0
 - tashi-vertex from `https://github.com/tashigit/tashi-vertex-rs.git`
+- 4 engines as separate OS processes, each with its own single-threaded tokio runtime
+- Same keypair and port used for the restarted node

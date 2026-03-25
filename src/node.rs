@@ -1,4 +1,5 @@
 use std::rc::Rc;
+
 use tashi_vertex::{
     Context, Engine, KeyPublic, KeySecret, Message, Options, Peers, Socket, Transaction,
 };
@@ -19,54 +20,70 @@ pub async fn run(
     vertex_peers.insert(bind, &key.public(), Default::default()).unwrap();
 
     let context = Context::new().unwrap();
-    let socket = Socket::bind(&context, bind).await.unwrap();
+    let socket = {
+        let mut attempts = 0;
+        loop {
+            match Socket::bind(&context, bind).await {
+                Ok(s) => break s,
+                Err(_) if attempts < 20 => {
+                    attempts += 1;
+                    println!("Port busy, retrying ({attempts}/20)...");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => panic!("Failed to bind after retries: {e:?}"),
+            }
+        }
+    };
 
     let mut options = Options::default();
     options.set_fallen_behind_kick_s(10);
-    options.set_heartbeat_us(50_000);
-    options.set_base_min_event_interval_us(10_000);
 
     let engine = Rc::new(Engine::start(&context, socket, options, &key, vertex_peers).unwrap());
     println!("Engine started");
 
-    let mut sync_seen = false;
-    loop {
-        let msg = tokio::select! {
-            msg = engine.recv_message() => msg,
-            _ = tokio::signal::ctrl_c() => {
-                println!("Received signal, shutting down");
-                return;
-            }
-        };
+    let mut sync_count = 0u64;
+    let mut sent_hello = false;
 
+    while let Some(msg) = engine.recv_message().await.unwrap() {
         match msg {
-            Ok(Some(Message::SyncPoint(_))) => {
-                if !sync_seen {
-                    sync_seen = true;
-                    println!("First SyncPoint — sending hello");
+            Message::SyncPoint(_) => {
+                sync_count += 1;
+                println!("SyncPoint #{sync_count}");
+
+                if !sent_hello {
+                    sent_hello = true;
                     let data = format!("hello from {label}");
                     let mut tx = Transaction::allocate(data.len());
                     tx.copy_from_slice(data.as_bytes());
                     engine.send_transaction(tx).unwrap();
+                    println!("Sent hello transaction");
+                }
+
+                // Send a ping every 3rd sync point
+                if sync_count > 1 && sync_count % 3 == 0 {
+                    let data = format!("ping from {label} at sync {sync_count}");
+                    let mut tx = Transaction::allocate(data.len());
+                    tx.copy_from_slice(data.as_bytes());
+                    engine.send_transaction(tx).unwrap();
+                    println!("Sent ping at sync {sync_count}");
                 }
             }
-            Ok(Some(Message::Event(event))) => {
+            Message::Event(event) => {
                 if event.transaction_count() > 0 {
-                    println!(
-                        "Event: txns={} consensus_at={}",
-                        event.transaction_count(),
-                        event.consensus_at()
-                    );
+                    let creator = event.creator().to_string();
+                    let short = &creator[creator.len().saturating_sub(8)..];
+                    for tx_data in event.transactions() {
+                        let payload = String::from_utf8_lossy(tx_data);
+                        println!(
+                            "EVENT from ...{short}: \"{}\" (consensus_at={})",
+                            payload,
+                            event.consensus_at()
+                        );
+                    }
                 }
-            }
-            Ok(None) => {
-                println!("Engine closed");
-                return;
-            }
-            Err(e) => {
-                println!("Error: {e}");
-                return;
             }
         }
     }
+
+    println!("Engine closed");
 }
