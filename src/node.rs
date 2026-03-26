@@ -59,8 +59,8 @@ pub async fn run(
                     println!("Sent hello transaction");
                 }
 
-                // Send a ping every 3rd sync point
-                if sync_count > 1 && sync_count % 3 == 0 {
+                // Send a ping on every sync point after the first
+                if sync_count > 1 {
                     let data = format!("ping from {label} at sync {sync_count}");
                     let mut tx = Transaction::allocate(data.len());
                     tx.copy_from_slice(data.as_bytes());
