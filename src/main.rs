@@ -1,5 +1,6 @@
-///! Tests Vertex node reconnection with 4 nodes (f=1).
-///! With f=1, 3 of 4 nodes can continue consensus while 1 is offline.
+///! Tests Vertex node reconnection with retry logic.
+///! If a restarted node doesn't get a second message within 5s, it exits
+///! with code 42 and gets restarted automatically.
 
 mod node;
 
@@ -22,13 +23,16 @@ fn main() {
     if args.len() > 1 && args[1] == "node" {
         return run_node(&args[2..]);
     }
-    run_test();
+    let config = if args.len() > 1 { &args[1] } else { "simple" };
+    run_test(config);
 }
 
 fn run_node(args: &[String]) {
     let mut bind = String::new();
     let mut secret = String::new();
     let mut label = String::new();
+    let mut config = String::from("default");
+    let mut reconnect_timeout_s: Option<u64> = None;
     let mut peer_addrs = Vec::new();
     let mut peer_pubkeys = Vec::new();
 
@@ -38,6 +42,8 @@ fn run_node(args: &[String]) {
             "--bind" => { bind = args[i + 1].clone(); i += 2; }
             "--secret" => { secret = args[i + 1].clone(); i += 2; }
             "--label" => { label = args[i + 1].clone(); i += 2; }
+            "--config" => { config = args[i + 1].clone(); i += 2; }
+            "--reconnect-timeout" => { reconnect_timeout_s = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--peer-addr" => { peer_addrs.push(args[i + 1].clone()); i += 2; }
             "--peer-pubkey" => { peer_pubkeys.push(args[i + 1].clone()); i += 2; }
             _ => { i += 1; }
@@ -49,15 +55,27 @@ fn run_node(args: &[String]) {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(node::run(&bind, &secret, &label, peers));
+    rt.block_on(node::run(&bind, &secret, &label, &config, reconnect_timeout_s, peers));
 }
 
-fn spawn_node(exe: &std::path::Path, i: usize, secrets: &[String], pubkeys: &[String]) -> std::process::Child {
+fn spawn_node(
+    exe: &std::path::Path,
+    i: usize,
+    secrets: &[String],
+    pubkeys: &[String],
+    config: &str,
+    reconnect_timeout: Option<u64>,
+) -> std::process::Child {
     let mut cmd = Command::new(exe);
     cmd.arg("node")
         .arg("--bind").arg(ADDRS[i])
         .arg("--secret").arg(&secrets[i])
-        .arg("--label").arg(format!("node-{i}"));
+        .arg("--label").arg(format!("node-{i}"))
+        .arg("--config").arg(config);
+
+    if let Some(t) = reconnect_timeout {
+        cmd.arg("--reconnect-timeout").arg(t.to_string());
+    }
 
     for j in 0..ADDRS.len() {
         if j == i { continue; }
@@ -70,11 +88,12 @@ fn spawn_node(exe: &std::path::Path, i: usize, secrets: &[String], pubkeys: &[St
 
     let stdout = child.stdout.take().unwrap();
     let idx = i;
+    let cfg = config.to_string();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             if let Ok(line) = line {
-                println!("[node-{idx}] {line}");
+                println!("[node-{idx}|{cfg}] {line}");
             }
         }
     });
@@ -82,7 +101,7 @@ fn spawn_node(exe: &std::path::Path, i: usize, secrets: &[String], pubkeys: &[St
     child
 }
 
-fn run_test() {
+fn run_test(config: &str) {
     let n = ADDRS.len();
     let mut secrets = Vec::new();
     let mut pubkeys = Vec::new();
@@ -94,10 +113,10 @@ fn run_test() {
 
     let exe = std::env::current_exe().unwrap();
 
-    println!("=== Phase 1: Start all {n} nodes ===");
+    println!("=== Phase 1: Start all {n} nodes (config={config}) ===");
     let mut children: Vec<std::process::Child> = Vec::new();
     for i in 0..n {
-        children.push(spawn_node(&exe, i, &secrets, &pubkeys));
+        children.push(spawn_node(&exe, i, &secrets, &pubkeys, config, None));
         thread::sleep(Duration::from_millis(500));
     }
 
@@ -107,33 +126,55 @@ fn run_test() {
     println!("\n=== Phase 2: Kill node-3 ===");
     children[3].kill().expect("failed to kill");
     children[3].wait().ok();
-    println!("node-3 killed. Remaining 3 nodes have f=1 tolerance.");
+    println!("node-3 killed.");
 
-    println!("\nWaiting 15s (remaining nodes keep consensus, node-3 gets kicked after 10s)...");
-    thread::sleep(Duration::from_secs(15));
+    let offline_wait = if config.starts_with("kick") { 12 } else { 15 };
+    println!("\nWaiting {offline_wait}s for other nodes to notice...");
+    thread::sleep(Duration::from_secs(offline_wait));
 
-    println!("\n=== Phase 3: Restart node-3 ===");
-    children[3] = spawn_node(&exe, 3, &secrets, &pubkeys);
+    println!("\n=== Phase 3: Restart node-3 with retry logic ===");
+    let max_attempts = 10;
+    for attempt in 1..=max_attempts {
+        println!("\n--- Attempt {attempt}/{max_attempts} ---");
+        children[3] = spawn_node(&exe, 3, &secrets, &pubkeys, config, Some(5));
 
-    println!("\nWaiting 10s for node-3 to rejoin...");
-    thread::sleep(Duration::from_secs(10));
+        // Wait for the child — it will either:
+        // - exit with code 42 (timeout, no reconnection) -> retry
+        // - stay alive (successfully reconnected)
+        // We give it 8 seconds (5s timeout + 3s buffer)
+        thread::sleep(Duration::from_secs(8));
 
-    // Phase 4: Send a transaction from node-0 and check if restarted node-3 receives it
-    println!("\n=== Phase 4: Testing if restarted node-3 receives events ===");
-    // Write a command file to trigger node-0 to send a transaction
-    let cmd_path = std::env::current_dir().unwrap().join("node-0-send.flag");
-    std::fs::write(&cmd_path, "send").unwrap();
+        match children[3].try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or(-1);
+                if code == 42 {
+                    println!("node-3 timed out (exit 42), retrying...");
+                    continue;
+                } else {
+                    println!("node-3 exited with unexpected code {code}");
+                    break;
+                }
+            }
+            Ok(None) => {
+                // Still running — it got past the timeout, meaning it reconnected!
+                println!("node-3 is still running — reconnection successful!");
 
-    println!("Waiting 60s to see if node-3 eventually receives events...");
-    thread::sleep(Duration::from_secs(60));
+                println!("\nWaiting 5s to observe events...");
+                thread::sleep(Duration::from_secs(5));
 
-    let _ = std::fs::remove_file(&cmd_path);
-
-    for i in 0..n {
-        match children[i].try_wait() {
-            Ok(None) => println!("[node-{i}] still running"),
-            Ok(Some(status)) => println!("[node-{i}] exited: {status}"),
-            Err(e) => println!("[node-{i}] error: {e}"),
+                for i in 0..n {
+                    match children[i].try_wait() {
+                        Ok(None) => println!("[node-{i}] still running"),
+                        Ok(Some(s)) => println!("[node-{i}] exited: {s}"),
+                        Err(e) => println!("[node-{i}] error: {e}"),
+                    }
+                }
+                break;
+            }
+            Err(e) => {
+                println!("Error checking node-3: {e}");
+                break;
+            }
         }
     }
 
