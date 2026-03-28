@@ -1,52 +1,51 @@
-# Vertex Engine Reconnection Issue — Reproduction
+# Vertex Reconnection Issue — Minimal Reproduction
 
-A restarted Vertex node can send transactions to the cluster but never receives events back. Consensus continues among the remaining nodes but the restarted node is permanently frozen.
+A restarted Vertex node can **send** transactions but **never receives** events back, even with state sharing enabled.
 
-## Steps to reproduce
+## Quick start
 
 ```bash
 cargo run
 ```
 
-## What the repro does
+## What it does
 
-1. Starts 4 Vertex engines as separate OS processes (f=1 fault tolerance)
-2. Waits for consensus — all 4 nodes exchange hello transactions successfully
+1. Starts 4 Vertex nodes as separate OS processes (f=1 fault tolerance)
+2. All 4 nodes reach consensus and exchange hello transactions
 3. Kills node-3
-4. Waits 15 seconds (node-3 gets kicked via `fallen_behind_kick_s(10)`)
+4. Waits 15s for the remaining nodes to kick node-3 (`fallen_behind_kick_s=10`)
 5. Restarts node-3 with the same keypair, port, and peer list
-6. Node-3 sends a hello — the other 3 nodes receive it through consensus
-7. Waits 60 seconds — node-3 never receives any events
+6. Node-3 sends a hello — **other nodes receive it**
+7. Node-3 **never receives any events back**
 
-## Expected behavior
+## Options used
 
-After restart, node-3 should receive consensus events from other nodes and fully participate in the cluster.
+All nodes use identical options:
 
-## Actual behavior
+```rust
+let mut options = Options::default();
+options.set_fallen_behind_kick_s(10);
+options.set_enable_state_sharing(true);
+options.set_epoch_states_to_cache(10);
+```
 
-- Node-3 gets SyncPoint #1 on boot, sends its hello transaction
-- Other nodes receive node-3's hello (consensus processes it)
+`dynamic_epoch_size` defaults to `true`. Values of `epoch_states_to_cache` from `3` (default) up to `50` were tested with no difference.
+
+## Expected
+
+After restart, node-3 downloads missed state from peers and resumes receiving consensus events.
+
+## Actual
+
+- Node-3 boots and gets SyncPoint #1
+- Node-3 sends a hello transaction — other nodes receive it via consensus
 - Node-3 never receives another SyncPoint or Event
-- Consensus continues normally among nodes 0, 1, 2 (they exchange pings and get further SyncPoints)
-- Node-3 is permanently frozen — it can inject one transaction but never receives
-
-## Configurations tested
-
-All produce the same result:
-
-| Configuration | Receives events after restart? |
-|---|---|
-| `Options::default()` | No |
-| `fallen_behind_kick_s(10)` | No |
-| `fallen_behind_kick_s(-1)` (never kick) | No |
-| `enable_state_sharing(true)` + `epoch_states_to_cache(3)` | No |
-| `fallen_behind_kick_s(10)` + `enable_state_sharing(true)` + `epoch_states_to_cache(3)` | No |
-| `report_gossip_events(true)` + `fallen_behind_kick_s(10)` | No |
-| `fallen_behind_kick_s(10)` + `enable_dynamic_epoch_size(false)` | No |
+- The other 3 nodes continue consensus normally among themselves
+- This is a **unidirectional** problem: outbound works, inbound is broken
 
 ## Environment
 
 - macOS Darwin 25.2.0
-- tashi-vertex from `https://github.com/tashigit/tashi-vertex-rs.git`
+- `tashi-vertex` from https://github.com/tashigit/tashi-vertex-rs.git
 - 4 engines as separate OS processes, each with its own single-threaded tokio runtime
-- Same keypair and port used for the restarted node
+- Same keypair and port reused for the restarted node
