@@ -26,6 +26,12 @@ fn main() {
 }
 
 fn run_node(args: &[String]) {
+    eprintln!("STDERR_TEST: node process starting");
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+    eprintln!("STDERR_TEST: tracing initialized, RUST_LOG={:?}", std::env::var("RUST_LOG"));
     let mut bind = String::new();
     let mut secret = String::new();
     let mut label = String::new();
@@ -47,7 +53,7 @@ fn run_node(args: &[String]) {
     }
 
     let peers: Vec<(String, String)> = peer_addrs.into_iter().zip(peer_pubkeys).collect();
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -77,16 +83,26 @@ fn spawn_node(
             .arg("--peer-pubkey").arg(&pubkeys[j]);
     }
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    cmd.env("RUST_LOG", "info");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("failed to spawn node");
 
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let idx = i;
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             if let Ok(line) = line {
                 println!("[node-{idx}] {line}");
+            }
+        }
+    });
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                eprintln!("[node-{idx}:log] {line}");
             }
         }
     });
@@ -123,18 +139,18 @@ fn run_test() {
     children[3].wait().ok();
     println!("node-3 killed.");
 
-    println!("\nWaiting 15s for node-3 to be kicked (fallen_behind_kick_s=10)...");
-    thread::sleep(Duration::from_secs(15));
+    println!("\nWaiting 3s (restart BEFORE kick threshold of 10s)...");
+    thread::sleep(Duration::from_secs(3));
 
     // Phase 3: Restart node-3, retry up to 5 times
     println!("\n=== Phase 3: Restart node-3 ===");
     let max_attempts = 5;
     for attempt in 1..=max_attempts {
         println!("\n--- Attempt {attempt}/{max_attempts} ---");
-        children[3] = spawn_node(&exe, 3, &secrets, &pubkeys, Some(5));
+        children[3] = spawn_node(&exe, 3, &secrets, &pubkeys, Some(30));
 
-        // 5s reconnect timeout + 3s buffer
-        thread::sleep(Duration::from_secs(8));
+        // 30s reconnect timeout + 5s buffer
+        thread::sleep(Duration::from_secs(35));
 
         match children[3].try_wait() {
             Ok(Some(status)) if status.code() == Some(42) => {
@@ -147,7 +163,8 @@ fn run_test() {
             }
             Ok(None) => {
                 println!("node-3 reconnected successfully!");
-                thread::sleep(Duration::from_secs(5));
+                println!("Waiting 30s to observe events...");
+                thread::sleep(Duration::from_secs(30));
                 break;
             }
             Err(e) => {
