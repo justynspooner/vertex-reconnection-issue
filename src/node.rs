@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use tashi_vertex::{
     Context, Engine, KeyPublic, KeySecret, Message, Options, Peers, Socket, Transaction,
 };
@@ -40,7 +38,10 @@ pub async fn run(
     options.set_enable_state_sharing(true);
     options.set_epoch_states_to_cache(10);
 
-    let engine = Rc::new(Engine::start(&context, socket, options, &key, peers).unwrap());
+    // If reconnect_timeout_s is set, this is a restarted node that needs
+    // to join an existing session rather than creating a new one.
+    let joining = reconnect_timeout_s.is_some();
+    let engine = Engine::start(&context, socket, options, &key, peers, joining).unwrap();
     println!("Engine started");
 
     let mut sync_count = 0u64;
