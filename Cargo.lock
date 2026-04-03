@@ -295,6 +295,8 @@ dependencies = [
 [[package]]
 name = "tashi-vertex"
 version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7896789f185b99b8f4a671351e84bbe8dd81a4fdfe84e9c90031181b8208a02"
 dependencies = [
  "anyhow",
  "cmake",
