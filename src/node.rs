@@ -107,6 +107,10 @@ pub async fn run(
             // Branch 3: receive a message from the consensus engine.
             result = engine.recv_message() => {
                 let Some(msg) = result.unwrap() else {
+                    if watching && !unseen.is_empty() {
+                        println!("ENGINE CLOSED with unsatisfied prefixes: {unseen:?}");
+                        std::process::exit(42);
+                    }
                     println!("engine closed");
                     return;
                 };
@@ -118,9 +122,11 @@ pub async fn run(
 
                         if !sent_hello {
                             sent_hello = true;
-                            let hello = format!("hello:{label}");
-                            send_payload(&engine, &hello);
-                            println!("SENT \"{hello}\"");
+                            let tag = if joining { "rejoin" } else { "hello" };
+                            let msg = format!("{tag}:{label}");
+                            send_payload(&engine, &msg);
+                            println!("SENT \"{msg}\"");
+
                         }
                     }
                     Message::Event(event) => {

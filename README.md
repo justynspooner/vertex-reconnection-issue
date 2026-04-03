@@ -1,6 +1,10 @@
-# Vertex Restart-After-Eviction Repro
+# Vertex Reconnection Issue — Reproduction
 
-Reproduction harness for restart/rejoin failures in `tashi-vertex 0.13.0`.
+Reproduction harness for a reconnection bug in `tashi-vertex 0.13.0`.
+
+After a node is killed and restarted with `joining=true` (before the idle kick
+threshold), it fails to participate in live consensus. State replay is
+intermittent, and live event delivery never works.
 
 ## Quick start
 
@@ -26,25 +30,50 @@ The test verifies three things about the restarted node:
 
 | Check | What it proves | How |
 |-------|---------------|-----|
-| Replay | Missed state is recovered via state sharing | Restarted node sees an `offline:*` event |
-| Inbound | Live consensus resumes | Restarted node sees a `live:*` event |
-| Outbound | Restarted node can send | A surviving node receives `hello:node-1` |
+| Replay | Missed state is recovered via state sharing | Restarted node sees `offline:*` events |
+| Inbound | Live consensus resumes after catch-up | Restarted node sees a `live:*` event |
+| Outbound | Restarted node can send after catch-up | A surviving node receives `rejoin:node-1` |
+
+## Test results (5 consecutive runs)
+
+| Run | Replay (`offline:*`) | Live (`live:*`) | Outbound (`rejoin:`) | Engine closed? |
+|-----|---------------------|----------------|---------------------|---------------|
+| 1 | Received all 3 | Never received | Not checked | No |
+| 2 | Never received | Never received | Not checked | No |
+| 3 | Never received | Never received | Not checked | No |
+| 4 | Received all 3 | Never received | Received (during replay) | Yes — closed after SyncPoint #2 |
+| 5 | Received all 3 | Never received | Not checked | No |
+
+**Result: 5/5 runs failed.** Live consensus never resumes after reconnection.
+
+### Key observations
+
+1. **State replay is intermittent** — in 3 out of 5 runs the restarted node
+   successfully replayed missed `offline:*` events; in 2 runs it received
+   nothing at all after SyncPoint #1.
+
+2. **Live consensus never works** — across all 5 runs, the restarted node
+   never received a single `live:*` event. The node is completely stuck after
+   catch-up completes.
+
+3. **Engine sometimes closes unexpectedly** — in run 4, the engine shut down
+   after SyncPoint #2 instead of continuing to deliver live events. The
+   `rejoin:node-1` transaction was received by surviving nodes (confirming
+   outbound worked during replay), but the engine closed before any live
+   traffic could arrive.
+
+4. **The problem is unidirectional during replay** — when replay works, the
+   restarted node can send transactions that other nodes receive (run 4 shows
+   `rejoin:node-1` delivered to peers). But after the replay window closes,
+   both inbound and outbound stop.
 
 ## Expected (passing)
 
 ```
 [PASS] Replay + Inbound: restarted node received both
        "offline:" (replay) and "live:" (inbound) events
-[PASS] Outbound: node-0 received "hello:node-1" from the restarted node
+[PASS] Outbound: node-0 received "rejoin:node-1" from the restarted node
 ```
-
-## Actual failure (issue reproduces)
-
-```
-[FAIL] ISSUE REPRODUCED: restarted node timed out waiting for events.
-```
-
-The restarted node never receives any events and exits with code 42 after timing out.
 
 ## Options
 

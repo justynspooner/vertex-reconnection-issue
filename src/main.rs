@@ -172,7 +172,6 @@ fn spawn_node(
         cmd.arg("--watch-timeout-s")
             .arg(watch_timeout_s.to_string());
     }
-
     for j in 0..ADDRS.len() {
         if j == i {
             continue;
@@ -371,15 +370,16 @@ fn run_test() {
         }
     };
 
-    // Check 2: Outbound (did any surviving node receive the restarted node's hello?).
-    // The restarted node sends "hello:node-1" on its first SyncPoint. If any surviving
-    // node printed an EVENT line containing that payload, outbound is verified.
+    // Check 2: Outbound (did any surviving node receive the restarted node's rejoin msg?).
+    // The restarted node sends "rejoin:node-1" (not "hello:", to avoid matching the
+    // original pre-kill hello) on its first SyncPoint. If any surviving node printed
+    // an EVENT line containing that payload, outbound is verified.
     let mut outbound_ok = false;
     for i in [0, 2, 3] {
         if let Some(ref node) = nodes[i] {
             let lines = node.stdout_lines.lock().unwrap();
-            if lines.iter().any(|l| l.contains("\"hello:node-1\"")) {
-                println!("[PASS] Outbound: node-{i} received \"hello:node-1\" from the restarted node");
+            if lines.iter().any(|l| l.contains("\"rejoin:node-1\"")) {
+                println!("[PASS] Outbound: node-{i} received \"rejoin:node-1\" from the restarted node");
                 outbound_ok = true;
                 break;
             }
@@ -389,7 +389,7 @@ fn run_test() {
         // Only flag as FAIL if the node actually came up (inbound passed).
         // If it never synced, outbound can't be expected to work either.
         if inbound_ok {
-            println!("[FAIL] Outbound: no surviving node received \"hello:node-1\"");
+            println!("[FAIL] Outbound: no surviving node received \"rejoin:node-1\"");
         } else {
             println!("[SKIP] Outbound: not checked (inbound failed, so outbound is moot)");
         }
